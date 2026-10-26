@@ -15,13 +15,17 @@ from wallhavenapi import (
     Category,
     Order,
     TopRange,
-    Color,
-    Type,
 )
 
 def say_error(message: str, exit_code: int = 1) -> int:
     print(f"wallhaven-dl: error: {message}", file=sys.stderr)
     return exit_code
+
+def say_msg(message: str) -> None:
+    print(message)
+
+class FileAlreadyExistsError(Exception):
+    pass
 
 def enum_args(parser, name: str, enum_cls, help: str):
     def parse_enum_list(value: str):
@@ -62,9 +66,10 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--output",
+        "--output-dir",
         type=str,
-        help="File name to save the wallpaper as (Default: ./wallpaper-ID.jpg). Arguments with trailing '/' create a new directory, if it doesn't exist, and uses the default naming scheme. Arguments without trailing slash become the file name."
+        default=".",
+        help="Directory to save the wallpaper in (Default: current directory)."
     )
     
     parser.add_argument(
@@ -152,23 +157,27 @@ def get_api_key(value: str):
     if not value:
         return None
         
-    file_path = os.path.expanduser(value)
+    path = os.path.expanduser(value)
     
-    if os.path.isfile(file_path):
-        with open(file_path, "r", encoding="utf-8") as file:
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as file:
             api_key = file.read().strip()
             
         if not api_key:
-            raise ValueError(f"API key file is empty: {file_path}")
+            raise ValueError(f"API key file is empty: {path}")
         
         return api_key
         
     return value
 
-def get_resolution(value: str):
+def get_resolution(value: str) -> tuple[int, int]:
     try:
-        w, h = value.lower().split("x")
-        w, h = int(w), int(h)
+        parts = value.lower().split("x")
+
+        if len(parts) != 2:
+            raise ValueError
+
+        w, h = (int(part.strip()) for part in parts)
         
         if w <= 0 or h <= 0:
             raise ValueError
@@ -177,130 +186,126 @@ def get_resolution(value: str):
         
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"Resolution must be positive WxH dimensions."
-            f"e.g. 1920x1080 (got '{value}')"
+            f"Invalid resolution '{value}'. "
+            "Expected positive WxH dimensions, e.g. 1920x1080."
         )
 
-def get_resolutions(value: str):
-    return [
-        get_resolution(item.strip())
-        for item in value.split(",")
-    ]
+def get_resolutions(value: str) -> list[tuple[int, int]]:
+    items = value.split(",")
 
-def get_save_path(save_path, wallpaper_id):
-    default_filename = f"wallpaper-{wallpaper_id}.jpg"
-    
-    if save_path is None:
-        save_path = default_filename
-    else:
-        save_path = os.path.expanduser(save_path)
-        
-        if os.path.isdir(save_path) or save_path.endswith(os.sep):
-            save_path = os.path.join(save_path, default_filename)
-        
-    if not os.path.isabs(save_path):
-        save_path = os.path.abspath(save_path)
-    
-    directory = os.path.dirname(save_path)
-    filename = os.path.basename(save_path)
-    name, extension = os.path.splitext(filename)
-    
-    if not extension:
-        extension = ".jpg"
-        filename = f"{name}{extension}"
-        save_path = os.path.join(directory, filename)
-    
+    if not all(item.strip() for item in items):
+        raise argparse.ArgumentTypeError(
+            "Resolutions must be comma-separated without empty entries."
+        )
+
+    resolutions = [get_resolution(item.strip()) for item in items]
+
+    if len(resolutions) != len(set(resolutions)):
+        raise argparse.ArgumentTypeError(
+            "Duplicate resolutions are not allowed."
+        )
+
+    return resolutions    
+
+def get_save_path(path, wallpaper_id):
+    path = os.path.abspath(os.path.expanduser(path or "."))
+    filename = f"wallpaper-{wallpaper_id}.jpg"
+    save_path = os.path.join(path, filename)
+
+    if os.path.exists(path) and not os.path.isdir(path):
+        raise NotADirectoryError(f"Output path is not a directory: {path}")
+
     if os.path.exists(save_path):
-        print(f"Warning: {save_path} already exists!")
-        default_filename = f"wallpaper-{wallpaper_id}{extension}"
-        
-        if filename == default_filename:
-            print(f"Download aborted.")
-            return None
-        
-        save_path = os.path.join(directory, default_filename)
-        
-        if os.path.exists(save_path):
-            print(f"Warning: {save_path} already exists! Download aborted.")
-            return None
+        raise FileAlreadyExistsError(save_path)
     
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(path, exist_ok=True)
     
     return save_path
 
-def download_wallpaper(api, wallpaper_id, save_path):
-    print(f"Downloading: {wallpaper_id}...")
-    
-    path = api.download_wallpaper(
-        wallpaper_id=wallpaper_id,
-        file_path=save_path
-    )
-    
-    if path:
-        print(f"Wallpaper saved to {path}")
-        return path
-
 def search_wallpaper(
-    api_key=None,
+    api,
     query=None,
-    save_path=None,
     atleast=None,
     resolutions=None,
     purities=None,
     sorting=None,
-    categories=None
+    categories=None,
+    order=None,
+    top_range=None,
 ):
-    api = WallhavenAPI(api_key=api_key)
-
     result = api.search(
         q=query,
         categories=categories,
         purities=purities,
         sorting=sorting,
+        order=order,
+        top_range=top_range,
         atleast=atleast,
-        resolutions=resolutions
+        resolutions=resolutions,
     )
     
     wallpapers = result.get("data", [])
     
     if not wallpapers:
-        print(f"Error: No wallpapers found.")
         return None
         
-    wallpaper_id = wallpapers[0]["id"]
+    return wallpapers[0]["id"]
+
+def download_wallpaper(api, wallpaper_id, save_path) -> str:
+    say_msg(f"Downloading {wallpaper_id}...")
     
-    save_path = get_save_path(save_path, wallpaper_id)
+    path = api.download_wallpaper(
+        wallpaper_id=wallpaper_id,
+        file_path=save_path,
+    )
     
-    if save_path is None:
-        return None
-        
-    return download_wallpaper(api, wallpaper_id, save_path)
+    if path:
+        say_msg(f"Wallpaper saved to {path}")
+    
+    return path
         
 def main() -> int:
     args = parse_args()
     
     try:
         api_key = get_api_key(args.api_key)
+        api = WallhavenAPI(api_key=api_key)
 
-        result = search_wallpaper(
-            api_key=api_key or None,
-            query=args.query or None,
-            save_path=args.output or None,
-            atleast=args.atleast or None,
-            resolutions=args.resolutions or None,
-            purities=args.purities or None,
-            sorting=args.sorting or None,
-            categories=args.categories or None
+        wallpaper_id = search_wallpaper(
+            api,
+            query=args.query,
+            atleast=args.atleast,
+            resolutions=args.resolutions,
+            purities=args.purities,
+            sorting=args.sorting,
+            categories=args.categories,
+            order=args.order,
+            top_range=args.top_range,
         )
         
-        if result is None:
+        if wallpaper_id is None:
             return say_error(
-                "No wallpaper downloaded. No results were found, "
-                "or the download was canceled because the file exists."
+                "No wallpaper found."
             )
+
+        save_path = get_save_path(
+            path=args.output_dir,
+            wallpaper_id=wallpaper_id,
+        )
+
+        download_wallpaper(
+            api,
+            wallpaper_id,
+            save_path,
+        )
         
         return 0
     
+    except FileAlreadyExistsError as e:
+        return say_error(
+            f"File already exists: {e}"
+        )
+
     except ApiKeyError as e:
         return say_error(
             f"{e}. Check your API key and account permissions."
